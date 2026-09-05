@@ -2,7 +2,7 @@ name: Daft.ie watcher
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes (GitHub may delay this a bit at busy times)
+    - cron: "*/10 * * * *"  # every 10 minutes (Playwright startup makes 5-min too tight)
   workflow_dispatch: {}      # lets you trigger it manually from the Actions tab
 
 permissions:
@@ -19,7 +19,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4
+        run: |
+          pip install requests beautifulsoup4 playwright
+          python -m playwright install --with-deps chromium
 
       - name: Run Daft check
         env:
