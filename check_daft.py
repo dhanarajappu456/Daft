@@ -1,42 +1,26 @@
 import os
 import re
-import json
 import sys
-from pathlib import Path
+import imaplib
+import email
+from email.header import decode_header
 
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
 import requests
 
 # ---- Configuration -------------------------------------------------------
-SEARCH_URLS = [
-    "https://www.daft.ie/property-for-rent/dublin-city/apartments?rentalPrice_to=1500",
-    "https://www.daft.ie/property-for-rent/dublin/apartments?rentalPrice_to=1500",
-]
-
-STATE_FILE = Path("data/seen_listings.json")
+IMAP_HOST = os.environ.get("IMAP_HOST") or "imap.gmail.com"
+IMAP_USER = os.environ["IMAP_USER"]
+IMAP_PASSWORD = os.environ["IMAP_PASSWORD"]
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
+# Loose default - tighten this once you've seen a real Daft alert land in
+# your inbox and checked its actual "From" address.
+SENDER_FILTER = os.environ.get("DAFT_SENDER_FILTER") or "daft.ie"
 
-LISTING_ID_RE = re.compile(r"/for-rent/[^\"'/]+/(\d+)")
+LISTING_URL_RE = re.compile(r"https://www\.daft\.ie/for-rent/[^\s\"'<>]+")
 # ---------------------------------------------------------------------------
-
-
-def load_seen():
-    if STATE_FILE.exists():
-        return set(json.loads(STATE_FILE.read_text()))
-    return set()
-
-
-def save_seen(seen):
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(sorted(seen)))
 
 
 def send_telegram(text):
@@ -55,99 +39,74 @@ def send_telegram(text):
         print("Telegram send failed:", resp.status_code, resp.text, file=sys.stderr)
 
 
-def parse_listings(html):
-    soup = BeautifulSoup(html, "html.parser")
-    results = {}
-    for a in soup.find_all("a", href=True):
-        m = LISTING_ID_RE.search(a["href"])
-        if not m:
-            continue
-        listing_id = m.group(1)
-        if listing_id in results:
-            continue
-
-        link = a["href"]
-        if link.startswith("/"):
-            link = "https://www.daft.ie" + link
-
-        card = a.find_parent("li") or a.find_parent("div") or a
-        text = " | ".join(t.strip() for t in card.stripped_strings if t.strip())
-        price_match = re.search(r"€[\d,]+", text)
-        price = price_match.group(0) if price_match else "price n/a"
-        title = a.get_text(strip=True) or text[:80]
-
-        results[listing_id] = {"id": listing_id, "url": link, "title": title, "price": price}
-    return list(results.values())
+def decode_str(value):
+    if not value:
+        return ""
+    parts = decode_header(value)
+    out = ""
+    for text, enc in parts:
+        if isinstance(text, bytes):
+            out += text.decode(enc or "utf-8", errors="ignore")
+        else:
+            out += text
+    return out
 
 
-def fetch_listings(page, url):
-    page.goto(url, wait_until="domcontentloaded", timeout=30000)
-    # give Cloudflare's JS challenge (if shown) a few seconds to resolve
-    page.wait_for_timeout(6000)
-
-    title = (page.title() or "").lower()
-    if "just a moment" in title or "attention required" in title or "checking your browser" in title:
-        raise RuntimeError(f"Blocked by Cloudflare challenge page (title={title!r})")
-
-    html = page.content()
-    listings = parse_listings(html)
-    if not listings:
-        # Save a snippet to logs so we can diagnose markup/blocking issues
-        print("DEBUG page title:", page.title(), file=sys.stderr)
-        print("DEBUG html length:", len(html), file=sys.stderr)
-    return listings
+def get_body(msg):
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/html" and "attachment" not in str(part.get("Content-Disposition") or ""):
+                return part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", errors="ignore")
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain":
+                return part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", errors="ignore")
+        return ""
+    return msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8", errors="ignore")
 
 
 def main():
-    seen = load_seen()
-    new_seen = set(seen)
-    new_listings = []
+    conn = imaplib.IMAP4_SSL(IMAP_HOST)
+    conn.login(IMAP_USER, IMAP_PASSWORD)
+    conn.select("INBOX")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        context = browser.new_context(
-            user_agent=USER_AGENT,
-            locale="en-IE",
-            timezone_id="Europe/Dublin",
-            viewport={"width": 1280, "height": 900},
-        )
-        # Basic stealth: hide the automation flag most bot-detection checks for
-        context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-        )
-        page = context.new_page()
+    status, data = conn.search(None, f'(UNSEEN FROM "{SENDER_FILTER}")')
+    if status != "OK":
+        print("IMAP search failed:", status, data, file=sys.stderr)
+        conn.logout()
+        return
 
-        for search_url in SEARCH_URLS:
-            try:
-                listings = fetch_listings(page, search_url)
-            except Exception as e:
-                print(f"Failed to fetch {search_url}: {e}", file=sys.stderr)
-                continue
+    ids = data[0].split()
+    if not ids:
+        print("No new Daft alert emails.")
+        conn.logout()
+        return
 
-            for listing in listings:
-                if listing["id"] not in seen:
-                    new_listings.append(listing)
-                    new_seen.add(listing["id"])
+    print(f"Found {len(ids)} new Daft alert email(s).")
 
-        browser.close()
+    for msg_id in ids:
+        status, msg_data = conn.fetch(msg_id, "(RFC822)")
+        if status != "OK":
+            continue
+        msg = email.message_from_bytes(msg_data[0][1])
+        subject = decode_str(msg.get("Subject"))
+        sender = decode_str(msg.get("From"))
+        body = get_body(msg)
 
-    if new_listings:
-        for listing in new_listings:
-            msg = (
-                f"\U0001F3E0 <b>New Daft listing</b>\n"
-                f"{listing['title']}\n"
-                f"{listing['price']}\n"
-                f"{listing['url']}"
+        links = sorted(set(LISTING_URL_RE.findall(body)))
+
+        if links:
+            for link in links:
+                send_telegram(f"\U0001F3E0 <b>New Daft alert</b>\n{subject}\n{link}")
+        else:
+            send_telegram(
+                f"\U0001F3E0 <b>New Daft alert</b>\n{subject}\n"
+                f"(from {sender} - couldn't extract a listing link, check your inbox)"
             )
-            send_telegram(msg)
-        print(f"Sent {len(new_listings)} new listing(s).")
-    else:
-        print("No new listings.")
 
-    save_seen(new_seen)
+        # Mark as read so it isn't processed again next run
+        conn.store(msg_id, "+FLAGS", "\\Seen")
+
+    conn.logout()
 
 
 if __name__ == "__main__":
